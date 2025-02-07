@@ -1,75 +1,105 @@
 <?php
-require($_SERVER["DOCUMENT_ROOT"] . "/bitrix/modules/main/include/prolog_before.php");
+require($_SERVER['DOCUMENT_ROOT'] . '/bitrix/modules/main/include/prolog_before.php');
 require $_SERVER['DOCUMENT_ROOT'] . '/local/scripts/vendor/autoload.php';
 
-use PhpOffice\PhpSpreadsheet\IOFactory;
 use Bitrix\Main\Loader;
-use Bitrix\Iblock\ElementTable;
+use PhpOffice\PhpSpreadsheet\IOFactory;
 
-Loader::includeModule("iblock");
+Loader::includeModule('iblock');
 
-$iblockId = 10; // Замените на актуальный ID вашего инфоблока
+function createIblockIfNotExists($variantProgram) {
+    $iblockType = 'polis';
+    $iblockCode = 'variant_' . strtolower(str_replace(' ', '_', $variantProgram));
 
-// Проверяем, существует ли инфоблок
-$iblockExists = \CIBlock::GetList([], ["ID" => $iblockId])->Fetch();
-if (!$iblockExists) {
-    echo json_encode(["status" => "error", "message" => "Инфоблок с ID $iblockId не найден."]);
-    exit;
-}
-
-// Путь к файлу обработки
-$filePath = $_SERVER['DOCUMENT_ROOT'] . "/local/scripts/act.xlsx";
-$batchSize = 100;
-$currentPosition = isset($_POST['position']) ? (int)$_POST['position'] : 0;
-
-// Загружаем данные из Excel
-$spreadsheet = IOFactory::load($filePath);
-$sheet = $spreadsheet->getActiveSheet();
-
-$data = [];
-foreach ($sheet->getRowIterator($currentPosition + 2, $currentPosition + $batchSize + 1) as $row) {
-    $rowData = [];
-    foreach ($row->getCellIterator() as $cell) {
-        $rowData[] = $cell->getValue();
-    }
-    $data[] = $rowData;
-}
-
-if (empty($data)) {
-    echo json_encode(["status" => "done"]);
-    exit;
-}
-
-// Обрабатываем элементы инфоблока
-foreach ($data as $row) {
-    $identifier = $row[1] ?? null;
-    if (!$identifier) continue; // Пропускаем пустые строки
-
-    $existingElement = ElementTable::getList([
-        'select' => ['ID'],
-        'filter' => ['IBLOCK_ID' => $iblockId, 'NAME' => $identifier],
-        'limit' => 1
-    ])->fetch();
-
-    if ($existingElement) {
-        continue; // Если элемент уже существует, пропускаем его
+    $existingIblock = CIBlock::GetList([], ['TYPE' => $iblockType, 'CODE' => $iblockCode])->Fetch();
+    if ($existingIblock) {
+        return $existingIblock['ID'];
     }
 
-    // Добавляем новый элемент
-    $el = new \CIBlockElement;
+    $iblock = new CIBlock;
+    $fields = [
+        'NAME' => $variantProgram,
+        'CODE' => $iblockCode,
+        'IBLOCK_TYPE_ID' => $iblockType,
+        'SITE_ID' => ['s1'],
+        'ACTIVE' => 'Y',
+    ];
+    return $iblock->Add($fields);
+}
+
+function createPropertyIfNotExists($iblockId, $propertyCode, $propertyName) {
+    $property = CIBlockProperty::GetList([], ['IBLOCK_ID' => $iblockId, 'CODE' => $propertyCode])->Fetch();
+    if ($property) {
+        return $property['ID'];
+    }
+
+    $ibp = new CIBlockProperty;
+    $fields = [
+        'IBLOCK_ID' => $iblockId,
+        'NAME' => $propertyName,
+        'CODE' => $propertyCode,
+        'PROPERTY_TYPE' => 'S',
+    ];
+    return $ibp->Add($fields);
+}
+
+function addElementToIblock($iblockId, $fields) {
+    $el = new CIBlockElement;
     $el->Add([
-        "IBLOCK_ID" => $iblockId,
-        "NAME" => $identifier,
-        "ACTIVE" => "Y",
-        "ACTIVE_FROM" => $row[2] ?? "",
-        "PROPERTY_VALUES" => [
-            "START_DATE" => $row[3] ?? "",
-            "END_DATE" => $row[4] ?? "",
-            "VARIANT" => $row[6] ?? "",
-            "REWARD" => isset($row[7]) ? str_replace(',', '.', $row[7]) : "", // Заменяем запятую на точку
-            "CODE" => $row[8] ?? ""
-        ]
+        'IBLOCK_ID' => $iblockId,
+        'NAME' => $fields['NAME'],
+        'ACTIVE_FROM' => $fields['ACTIVE_FROM'],
+        'ACTIVE_TO' => $fields['ACTIVE_TO'],
+        'PROPERTY_VALUES' => $fields['PROPERTIES'],
     ]);
 }
 
-echo json_encode(["status" => "in_progress", "next_position" => $currentPosition + $batchSize]);
+$filePath = $_SERVER['DOCUMENT_ROOT'] . '/local/scripts/act.xlsx';
+$spreadsheet = IOFactory::load($filePath);
+$worksheet = $spreadsheet->getActiveSheet();
+$data = $worksheet->toArray();
+
+$step = 100; // Количество строк за один шаг
+$position = isset($_POST['position']) ? (int)$_POST['position'] : 0;
+$totalRows = count($data);
+
+if ($position === 0) {
+    $position = 1; // Пропуск заголовков
+}
+
+for ($i = $position; $i < min($position + $step, $totalRows); $i++) {
+    $row = $data[$i];
+
+    $variantProgram = $row[6];
+    $iblockId = createIblockIfNotExists($variantProgram);
+
+    // Создаем свойства, если их еще нет
+    createPropertyIfNotExists($iblockId, 'DATE_ATT', 'Дата прикрепления');
+    createPropertyIfNotExists($iblockId, 'PROGRAMM', 'Программа');
+    createPropertyIfNotExists($iblockId, 'AWARD', 'Вознаграждение Исполнителя');
+    createPropertyIfNotExists($iblockId, 'CODE', 'Код программы');
+
+    $elementData = [
+        'NAME' => $row[1],
+        'ACTIVE_FROM' => $row[3],
+        'ACTIVE_TO' => $row[4],
+        'PROPERTIES' => [
+            'DATE_ATT' => $row[2],
+            'PROGRAMM' => $row[5],
+            'AWARD' => floatval(str_replace([' ', ','], ['', '.'], $row[7])),
+            'CODE' => $row[8],
+        ],
+    ];
+    addElementToIblock($iblockId, $elementData);
+}
+
+if ($position + $step >= $totalRows) {
+    echo json_encode(['status' => 'done']);
+} else {
+    echo json_encode([
+        'status' => 'in_progress',
+        'next_position' => $position + $step,
+    ]);
+}
+
+?>
